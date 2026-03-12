@@ -2087,14 +2087,10 @@ impl Session<Playing> {
             if matches!(s.state, StreamState::Playing { .. })
                 && let Err(ref description) = s.depacketizer
             {
-                bail!(ErrorInt::RtspResponseError {
-                    conn_ctx: *conn.inner.ctx(),
-                    msg_ctx: *inner.describe_ctx,
-                    method: msg::Method::DESCRIBE,
-                    cseq: *inner.describe_cseq,
-                    status: *inner.describe_status,
-                    description: description.clone(),
-                });
+                warn!(
+                    "stream {}:{} has broken depacketizer ({description}), skipping",
+                    s.media, s.encoding_name,
+                );
             }
         }
         Ok(Demuxed {
@@ -2683,7 +2679,10 @@ impl futures::Stream for Demuxed {
             };
             let depacketizer = match &mut stream.depacketizer {
                 Ok(d) => d,
-                Err(_) => unreachable!("depacketizer was Ok"),
+                Err(_) => {
+                    self.state = DemuxedState::Waiting;
+                    continue;
+                }
             };
             let conn_ctx = inner
                 .conn
