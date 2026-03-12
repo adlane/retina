@@ -605,11 +605,16 @@ pub(crate) fn parse_play(
     for s in rtp_info.split(',') {
         let s = s.trim();
         let mut parts = s.split(';');
-        let url = parts
+        let first_part = parts
             .next()
-            .expect("split always returns at least one part")
-            .strip_prefix("url=")
-            .ok_or_else(|| "RTP-Info missing stream URL".to_string())?;
+            .expect("split always returns at least one part");
+        let url = match first_part.strip_prefix("url=") {
+            Some(u) => u,
+            None => {
+                warn!("RTP-Info entry missing 'url=' prefix ({first_part:?}), skipping");
+                continue;
+            }
+        };
         let url = join_control(&presentation.base_url, url)?;
         let stream = if presentation.streams.len() == 1 {
             // The server is allowed to not specify a stream control URL for
