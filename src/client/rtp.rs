@@ -3,6 +3,8 @@
 
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 use log::{debug, warn};
 
@@ -45,11 +47,98 @@ struct Seq {
     next: u16,
 }
 
+const REORDER_WINDOW: u16 = 32;
+
+struct BufferedPacket {
+    data: Bytes,
+    pkt_ctx: PacketContext,
+}
+
+struct ReorderBuf {
+    slots: Vec<Option<BufferedPacket>>,
+    expected_seq: Option<u16>,
+    buffered_count: u16,
+}
+
+impl ReorderBuf {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(REORDER_WINDOW as usize);
+        slots.resize_with(REORDER_WINDOW as usize, || None);
+        Self {
+            slots,
+            expected_seq: None,
+            buffered_count: 0,
+        }
+    }
+
+    /// Insert a packet into the reorder buffer.
+    /// Returns true if it was stored, false if it was a duplicate or too old.
+    fn insert(&mut self, seq: u16, data: Bytes, pkt_ctx: PacketContext) -> bool {
+        let expected = match self.expected_seq {
+            Some(e) => e,
+            None => {
+                self.expected_seq = Some(seq);
+                seq
+            }
+        };
+
+        let ahead = seq.wrapping_sub(expected);
+        if ahead >= 0x8000 {
+            // Packet is behind expected_seq — too late.
+            return false;
+        }
+        if ahead >= REORDER_WINDOW {
+            // Packet is too far ahead; force-advance to make room.
+            let skip = ahead - REORDER_WINDOW + 1;
+            for _ in 0..skip {
+                let idx = self.expected_seq.unwrap() % REORDER_WINDOW;
+                if self.slots[idx as usize].take().is_some() {
+                    self.buffered_count -= 1;
+                }
+                self.expected_seq = Some(self.expected_seq.unwrap().wrapping_add(1));
+            }
+        }
+
+        let idx = (seq % REORDER_WINDOW) as usize;
+        if self.slots[idx].is_some() {
+            return false; // duplicate
+        }
+        self.slots[idx] = Some(BufferedPacket { data, pkt_ctx });
+        self.buffered_count += 1;
+        true
+    }
+
+    /// Drain consecutive packets starting from expected_seq.
+    /// Returns them in-order.
+    fn drain_ready(&mut self) -> Vec<(u16, Bytes, PacketContext)> {
+        let mut out = Vec::new();
+        let Some(mut seq) = self.expected_seq else {
+            return out;
+        };
+        loop {
+            let idx = (seq % REORDER_WINDOW) as usize;
+            match self.slots[idx].take() {
+                Some(pkt) => {
+                    self.buffered_count -= 1;
+                    out.push((seq, pkt.data, pkt.pkt_ctx));
+                    seq = seq.wrapping_add(1);
+                }
+                None => break,
+            }
+        }
+        if !out.is_empty() {
+            self.expected_seq = Some(seq);
+        }
+        out
+    }
+}
+
 /// RTP/RTCP demarshaller which ensures packets have the correct SSRC and
 /// monotonically increasing SEQ. Unstable; exposed for benchmark.
 ///
-/// When using UDP, skips and logs out-of-order packets. When using TCP,
-/// fails on them.
+/// When using UDP, packets are held in a small reorder buffer (~64 KB) and
+/// emitted in sequence-number order. When using TCP, they are processed
+/// immediately (TCP guarantees ordering).
 ///
 /// This reports packet loss (via [ReceivedPacket::loss]) but doesn't prohibit it
 /// of more than `i16::MAX` which would be indistinguishable from non-monotonic sequence numbers.
@@ -77,6 +166,22 @@ pub struct InorderParser {
 
     unknown_rtcp_session: UnknownRtcpSsrcPolicy,
     seen_unknown_rtcp_session: bool,
+
+    reorder: ReorderBuf,
+    ready_queue: VecDeque<PacketItem>,
+
+    reorder_recovered: u64,
+}
+
+// ReorderBuf doesn't impl Debug, so we manually impl Debug for InorderParser above
+// by adding #[derive(Debug)] and implementing Debug for ReorderBuf:
+impl std::fmt::Debug for ReorderBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReorderBuf")
+            .field("expected_seq", &self.expected_seq)
+            .field("buffered_count", &self.buffered_count)
+            .finish()
+    }
 }
 
 fn note_stale_live555_data_if_tcp(
@@ -120,11 +225,169 @@ impl InorderParser {
             seen_rtcp_packets: 0,
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
+            reorder: ReorderBuf::new(),
+            ready_queue: VecDeque::new(),
+            reorder_recovered: 0,
         }
+    }
+
+    /// Returns a previously-buffered packet from the ready queue, if any.
+    /// The caller should drain this before polling new UDP data.
+    pub fn poll_ready(&mut self) -> Option<PacketItem> {
+        self.ready_queue.pop_front()
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn rtp(
+        &mut self,
+        session_options: &SessionOptions,
+        stream_ctx: &StreamContext,
+        tool: Option<&super::Tool>,
+        conn_ctx: &ConnectionContext,
+        pkt_ctx: &PacketContext,
+        timeline: &mut Timeline,
+        stream_id: usize,
+        data: Bytes,
+    ) -> Result<Option<PacketItem>, Error> {
+        let is_udp = matches!(stream_ctx.0, StreamContextInner::Udp(..));
+
+        if is_udp {
+            return self.rtp_reorder(
+                session_options,
+                stream_ctx,
+                tool,
+                conn_ctx,
+                pkt_ctx,
+                timeline,
+                stream_id,
+                data,
+            );
+        }
+
+        // TCP path: process immediately (no reordering needed).
+        self.rtp_process(
+            session_options,
+            stream_ctx,
+            tool,
+            conn_ctx,
+            pkt_ctx,
+            timeline,
+            stream_id,
+            data,
+        )
+    }
+
+    /// UDP path: buffer the packet, then flush in-order packets.
+    #[allow(clippy::too_many_arguments)]
+    fn rtp_reorder(
+        &mut self,
+        session_options: &SessionOptions,
+        stream_ctx: &StreamContext,
+        tool: Option<&super::Tool>,
+        conn_ctx: &ConnectionContext,
+        pkt_ctx: &PacketContext,
+        timeline: &mut Timeline,
+        stream_id: usize,
+        data: Bytes,
+    ) -> Result<Option<PacketItem>, Error> {
+        // Quick-parse header to get seq and ssrc for buffering decisions.
+        let (raw, _payload_range) = match RawPacket::new(data.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                bail!(ErrorInt::PacketError {
+                    conn_ctx: *conn_ctx,
+                    stream_ctx: stream_ctx.to_owned(),
+                    pkt_ctx: *pkt_ctx,
+                    stream_id,
+                    description: format!(
+                        "corrupt RTP header while expecting seq={:?}: {:?}\n{:#?}",
+                        &self.seq,
+                        e.reason,
+                        crate::hex::LimitedHex::new(&e.data[..], 64),
+                    ),
+                });
+            }
+        };
+
+        if raw.payload_type() == 50 {
+            debug!("skipping pkt with invalid payload type 50");
+            return Ok(None);
+        }
+
+        let sequence_number = raw.sequence_number();
+        let ssrc = raw.ssrc();
+
+        // Validate SSRC (same as original code).
+        if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
+            note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
+            bail!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                pkt_ctx: *pkt_ctx,
+                stream_ctx: stream_ctx.to_owned(),
+                stream_id,
+                ssrc,
+                sequence_number,
+                description: format!(
+                    "wrong ssrc after {} RTP pkts + {} RTCP pkts; expecting ssrc={:?} seq={:?}",
+                    self.seen_rtp_packets, self.seen_rtcp_packets, self.ssrc, self.seq,
+                ),
+            });
+        } else if self.ssrc.is_none() {
+            self.ssrc = Some(Ssrc {
+                init: InitialExpectation::RtpPacket,
+                ssrc,
+            });
+        }
+
+        // Insert into reorder buffer.
+        if !self.reorder.insert(sequence_number, data, *pkt_ctx) {
+            debug!(
+                "reorder: dropping duplicate/late seq={sequence_number} (expected {:?})",
+                self.reorder.expected_seq
+            );
+            return Ok(self.ready_queue.pop_front());
+        }
+
+        // Flush consecutive in-order packets from the buffer.
+        let ready = self.reorder.drain_ready();
+        for (seq, pkt_data, ctx) in ready {
+            // Check if this packet was originally out-of-order but now recovered.
+            let was_reordered = if let Some(s) = self.seq {
+                let expected_loss = seq.wrapping_sub(s.next);
+                expected_loss > 0x8000
+            } else {
+                false
+            };
+            if was_reordered {
+                self.reorder_recovered += 1;
+            }
+
+            match self.rtp_process(
+                session_options,
+                stream_ctx,
+                tool,
+                conn_ctx,
+                &ctx,
+                timeline,
+                stream_id,
+                pkt_data,
+            ) {
+                Ok(Some(p)) => self.ready_queue.push_back(p),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("reorder: error processing buffered seq={seq}: {e}");
+                }
+            }
+        }
+
+        Ok(self.ready_queue.pop_front())
+    }
+
+    /// Process a single RTP packet through the full pipeline (SSRC check,
+    /// loss/ordering check, timeline advance). Used by both TCP (directly)
+    /// and UDP (after reorder buffer drains).
+    #[allow(clippy::too_many_arguments)]
+    fn rtp_process(
         &mut self,
         session_options: &SessionOptions,
         stream_ctx: &StreamContext,
@@ -200,11 +463,11 @@ impl InorderParser {
                     ),
                 });
             } else {
-                log::info!(
+                // With reorder buffer active this should be rare;
+                // the buffer has already been force-drained past this seq.
+                debug!(
                     "Skipping out-of-order seq={} when expecting ssrc={:08x?} seq={:?}",
-                    sequence_number,
-                    self.ssrc,
-                    self.seq,
+                    sequence_number, self.ssrc, self.seq,
                 );
                 return Ok(None);
             }
@@ -462,5 +725,58 @@ mod tests {
             }
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }
+    }
+
+    #[test]
+    fn reorder_recovery() {
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
+        let stream_ctx = StreamContext(StreamContextInner::Udp(UdpStreamContext {
+            local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            local_rtp_port: 0,
+            peer_rtp_port: 0,
+        }));
+        let session_options = SessionOptions::default();
+
+        // Send packets out of order: 10, 12, 11, 13
+        let seqs = [10u16, 12, 11, 13];
+        let mut results = Vec::new();
+
+        for &seq in &seqs {
+            let (pkt, _) = crate::rtp::RawPacketBuilder {
+                sequence_number: seq,
+                timestamp: seq as u32 * 3000,
+                payload_type: 96,
+                ssrc: 0xd25614e,
+                mark: true,
+            }
+            .build(vec![seq as u8; 10])
+            .unwrap();
+
+            match parser.rtp(
+                &session_options,
+                &stream_ctx,
+                None,
+                &ConnectionContext::dummy(),
+                &PacketContext::dummy(),
+                &mut timeline,
+                0,
+                pkt.0,
+            ) {
+                Ok(Some(PacketItem::Rtp(p))) => {
+                    results.push(p.raw.sequence_number());
+                }
+                Ok(None) => {}
+                o => panic!("unexpected result for seq={seq}: {o:#?}"),
+            }
+            // Also drain the ready queue.
+            while let Some(PacketItem::Rtp(p)) = parser.poll_ready() {
+                results.push(p.raw.sequence_number());
+            }
+        }
+
+        // All 4 packets should be emitted in order: 10, 11, 12, 13
+        assert_eq!(results, vec![10, 11, 12, 13]);
     }
 }
