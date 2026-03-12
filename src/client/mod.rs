@@ -2351,6 +2351,11 @@ impl Session<Playing> {
             .inner
             .ctx();
 
+        // Drain any previously buffered reorder-ready packets first.
+        if let Some(p) = rtp_handler.poll_ready() {
+            return Poll::Ready(Some(Ok(p)));
+        }
+
         // Prioritize RTCP over RTP within a stream.
         while let Poll::Ready(r) = udp_sockets.rtcp.poll_recv(cx, buf) {
             let when = Instant::now();
