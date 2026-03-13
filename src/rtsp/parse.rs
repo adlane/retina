@@ -16,6 +16,13 @@ use super::{
     table::is_tchar,
 };
 
+#[derive(Debug, derive_more::Display, derive_more::Error, Default)]
+pub enum ErrorSource {
+    #[default]
+    Simple,
+    WithSource(#[error(source)] Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Error detail carried by [`FeedError::Invalid`].
 #[derive(Debug, Default, derive_more::Error)]
 pub struct Invalid {
@@ -24,8 +31,7 @@ pub struct Invalid {
     /// ABNF production names, innermost first.
     pub context: Vec<&'static str>,
     /// Underlying error from a library call, if any.
-    #[error(source)]
-    pub source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    pub source: ErrorSource,
 }
 
 impl std::fmt::Display for Invalid {
@@ -41,7 +47,7 @@ impl std::fmt::Display for Invalid {
                 f.write_str(label)?;
             }
         }
-        if let Some(ref src) = self.source {
+        if let ErrorSource::WithSource(ref src) = self.source {
             write!(f, ": {src}")?;
         }
         Ok(())
@@ -91,7 +97,7 @@ fn invalid(label: &'static str) -> FeedError {
     FeedError::Invalid(Invalid {
         pos: 0,
         context: vec![label],
-        source: None,
+        source: ErrorSource::default(),
     })
 }
 
@@ -102,7 +108,7 @@ fn invalid_err<E: std::error::Error + Send + Sync + 'static>(
     FeedError::Invalid(Invalid {
         pos: 0,
         context: vec![label],
-        source: Some(Box::new(e)),
+        source: ErrorSource::WithSource(Box::new(e)),
     })
 }
 
