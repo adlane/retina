@@ -2079,7 +2079,7 @@ impl Session<Playing> {
     /// Fails if a stream that has been setup can't be depacketized.
     pub fn demuxed(mut self) -> Result<Demuxed, Error> {
         let inner = self.0.as_mut().project();
-        let conn = inner
+        let _conn = inner
             .conn
             .as_ref()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
